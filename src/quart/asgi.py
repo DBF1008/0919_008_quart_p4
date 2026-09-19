@@ -42,12 +42,80 @@ if TYPE_CHECKING:
     from .app import Quart  # noqa: F401
 
 
+HEALTH_CHECK_PATH = "/health"
+
+
+async def _send_service_unavailable(send: ASGISendCallable) -> None:
+    await send(
+        cast(
+            HTTPResponseStartEvent,
+            {
+                "type": "http.response.start",
+                "status": 503,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"connection", b"close"),
+                ],
+            },
+        )
+    )
+    await send(
+        cast(
+            HTTPResponseBodyEvent,
+            {"type": "http.response.body", "body": b"Service Unavailable"},
+        )
+    )
+
+
+async def _send_health_response(app: Quart, send: ASGISendCallable) -> None:
+    # Handled directly here, without tracking, so that health checks
+    # remain available and never block the graceful drain.
+    data, status, headers = await app._health_check()
+    body = app.json.dumps(data).encode("utf-8")
+    header_list = [(b"content-type", b"application/json")]
+    header_list += [
+        (name.lower().encode("latin1"), value.encode("latin1"))
+        for name, value in headers.items()
+    ]
+    await send(
+        cast(
+            HTTPResponseStartEvent,
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": header_list,
+            },
+        )
+    )
+    await send(
+        cast(HTTPResponseBodyEvent, {"type": "http.response.body", "body": body})
+    )
+
+
 class ASGIHTTPConnection:
     def __init__(self, app: Quart, scope: HTTPScope) -> None:
         self.app = app
         self.scope = scope
 
     async def __call__(
+        self, receive: ASGIReceiveCallable, send: ASGISendCallable
+    ) -> None:
+        if self.scope["path"] == HEALTH_CHECK_PATH:
+            await _send_health_response(self.app, send)
+            return
+        if not self.app.connection_tracker.is_accepting():
+            await _send_service_unavailable(send)
+            return
+        task = asyncio.current_task()
+        if task is not None:
+            self.app.connection_tracker.register(task)
+        try:
+            await self._handle(receive, send)
+        finally:
+            if task is not None:
+                self.app.connection_tracker.release(task)
+
+    async def _handle(
         self, receive: ASGIReceiveCallable, send: ASGISendCallable
     ) -> None:
         request = self._create_request_from_scope(send)
@@ -185,6 +253,23 @@ class ASGIWebsocketConnection:
         self._closed = False
 
     async def __call__(
+        self, receive: ASGIReceiveCallable, send: ASGISendCallable
+    ) -> None:
+        if not self.app.connection_tracker.is_accepting():
+            await send(
+                cast(WebsocketCloseEvent, {"type": "websocket.close", "code": 1001})
+            )
+            return
+        task = asyncio.current_task()
+        if task is not None:
+            self.app.connection_tracker.register(task)
+        try:
+            await self._handle(receive, send)
+        finally:
+            if task is not None:
+                self.app.connection_tracker.release(task)
+
+    async def _handle(
         self, receive: ASGIReceiveCallable, send: ASGISendCallable
     ) -> None:
         websocket = self._create_websocket_from_scope(send)
@@ -379,6 +464,14 @@ class ASGILifespan:
                     )
             elif event["type"] == "lifespan.shutdown":
                 try:
+                    # shutdown() gracefully drains the in-flight
+                    # connections (see Quart.start_shutdown) and waits
+                    # for the background tasks before returning, so the
+                    # lifespan.shutdown.complete message is only sent
+                    # once everything has finished. This complements
+                    # the server's (e.g. Hypercorn's graceful_timeout)
+                    # own draining, which should be configured to be at
+                    # least the GRACEFUL_SHUTDOWN_TIMEOUT.
                     await self.app.shutdown()
                 except Exception as error:
                     await send(

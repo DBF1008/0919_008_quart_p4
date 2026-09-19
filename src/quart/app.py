@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator
 from collections.abc import Awaitable
 from collections.abc import Coroutine
 from datetime import timedelta
+from enum import Enum
 from inspect import isasyncgen
 from inspect import iscoroutinefunction as _inspect_iscoroutinefunction
 from inspect import isgenerator
@@ -165,6 +166,97 @@ def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
     return timedelta(seconds=value)
 
 
+class ShutdownState(Enum):
+    """The graceful-shutdown state of the app.
+
+    Attributes:
+        READY: Serving requests as normal.
+        SHUTTING_DOWN: No longer accepting new connections, waiting
+            for in-flight connections to drain.
+        SHUTDOWN: Fully shut down, all connections closed.
+    """
+
+    READY = "ready"
+    SHUTTING_DOWN = "shutting_down"
+    SHUTDOWN = "shutdown"
+
+
+class ConnectionTracker:
+    """Tracks the in-flight (active) connections to the app.
+
+    This is used to gracefully shutdown, whereby the app stops
+    accepting new connections and waits for the active connections to
+    complete (drain) before forcing any stragglers closed.
+    """
+
+    def __init__(self) -> None:
+        self.state = ShutdownState.READY
+        self._connections: set[asyncio.Task] = set()
+        self._drained = asyncio.Event()
+        self._drained.set()
+
+    @property
+    def active_count(self) -> int:
+        """The number of in-flight connections."""
+        return len(self._connections)
+
+    def is_accepting(self) -> bool:
+        """Return True if new connections should be accepted."""
+        return self.state is ShutdownState.READY
+
+    def register(self, task: asyncio.Task) -> bool:
+        """Register the task as an active connection.
+
+        Returns False (without registering) if the tracker is no
+        longer accepting new connections.
+        """
+        if not self.is_accepting():
+            return False
+        self._connections.add(task)
+        self._drained.clear()
+        task.add_done_callback(self.release)
+        return True
+
+    def release(self, task: asyncio.Task) -> None:
+        """Remove the task from the active connections."""
+        self._connections.discard(task)
+        if not self._connections:
+            self._drained.set()
+
+    def begin_shutdown(self) -> None:
+        """Stop accepting new connections and start draining."""
+        if self.state is ShutdownState.READY:
+            self.state = ShutdownState.SHUTTING_DOWN
+
+    async def wait_drained(self, timeout: float | None = None) -> bool:
+        """Wait for the active connections to complete.
+
+        Returns True if all connections completed within the timeout,
+        False otherwise.
+        """
+        if not self._connections:
+            return True
+        try:
+            await asyncio.wait_for(self._drained.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def force_close(self) -> None:
+        """Forcefully close (cancel) any remaining connections."""
+        tasks = list(self._connections)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            self.release(task)
+
+    def complete_shutdown(self) -> None:
+        """Mark the shutdown as complete."""
+        self.state = ShutdownState.SHUTDOWN
+
+
 class Quart(App):
     """The web framework class, handles requests and returns responses.
 
@@ -246,6 +338,7 @@ class Quart(App):
             "DEBUG": None,
             "ENV": None,
             "EXPLAIN_TEMPLATE_LOADING": False,
+            "GRACEFUL_SHUTDOWN_TIMEOUT": 5,  # Second
             "MAX_CONTENT_LENGTH": 16 * 1024 * 1024,  # 16 MB Limit
             "MAX_COOKIE_SIZE": 4093,
             "MAX_FORM_MEMORY_SIZE": 500_000,
@@ -342,10 +435,15 @@ class Quart(App):
         ] = defaultdict(list)
         self.while_serving_gens: list[AsyncGenerator[None, None]] = []
 
+        self.connection_tracker = ConnectionTracker()
+        self.shutdown_event = self.event_class()
+
         self.template_context_processors[None] = [_default_template_ctx_processor]
 
         self.cli = AppGroup()
         self.cli.name = self.name
+
+        self.add_url_rule("/health", "_quart_health", self._health_check)
 
         if self.has_static_folder:
             assert bool(static_host) == host_matching, (
@@ -387,6 +485,23 @@ class Quart(App):
         if not self.has_static_folder:
             raise RuntimeError("No static folder for this object")
         return await send_from_directory(self.static_folder, filename)
+
+    async def _health_check(self) -> tuple[dict[str, Any], int, dict[str, str]]:
+        state = self.connection_tracker.state
+        if state is ShutdownState.READY:
+            status_code = 200
+            headers: dict[str, str] = {}
+        else:
+            status_code = 503
+            headers = {"Connection": "close"}
+        return (
+            {
+                "status": state.value,
+                "active_connections": self.connection_tracker.active_count,
+            },
+            status_code,
+            headers,
+        )
 
     async def open_resource(
         self,
@@ -925,6 +1040,7 @@ class Quart(App):
         if debug is not None:
             self.debug = debug
         config.errorlog = config.accesslog
+        config.graceful_timeout = self.config["GRACEFUL_SHUTDOWN_TIMEOUT"]
         config.keyfile = keyfile
 
         return serve(self, config, shutdown_trigger=shutdown_trigger)
@@ -1764,6 +1880,7 @@ class Quart(App):
 
     async def startup(self) -> None:
         self.shutdown_event = self.event_class()
+        self.connection_tracker.state = ShutdownState.READY
         try:
             async with self.app_context():
                 for func in self.before_serving_funcs:
@@ -1779,8 +1896,27 @@ class Quart(App):
             self.log_exception(sys.exc_info())
             raise
 
-    async def shutdown(self) -> None:
+    async def start_shutdown(self) -> None:
+        """Begin the graceful shutdown process.
+
+        This stops the app accepting new connections, signals to any
+        tasks waiting on the shutdown event, and then waits for any
+        in-flight connections to complete within the
+        ``GRACEFUL_SHUTDOWN_TIMEOUT``. Any connections still active
+        after the timeout are forcefully closed. This is idempotent.
+        """
+        if self.connection_tracker.state is not ShutdownState.READY:
+            return
+        self.connection_tracker.begin_shutdown()
         self.shutdown_event.set()
+        drained = await self.connection_tracker.wait_drained(
+            timeout=self.config["GRACEFUL_SHUTDOWN_TIMEOUT"]
+        )
+        if not drained:
+            await self.connection_tracker.force_close()
+
+    async def shutdown(self) -> None:
+        await self.start_shutdown()
         try:
             await asyncio.wait_for(
                 asyncio.gather(*self.background_tasks),
@@ -1808,6 +1944,8 @@ class Quart(App):
             )
             self.log_exception(sys.exc_info())
             raise
+        finally:
+            self.connection_tracker.complete_shutdown()
 
 
 def _cancel_all_tasks(loop: asyncio.AbstractEventLoop) -> None:

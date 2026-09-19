@@ -54,6 +54,30 @@ To use this functionality simply do the following:
     async def create_db_pool():
         await app.db_pool.close()
 
+Graceful shutdown
+-----------------
+
+When Quart shuts down (e.g. on ``SIGINT``/``SIGTERM`` or a lifespan
+shutdown event) it will gracefully drain the in-flight connections.
+New connections are rejected (``503`` for HTTP requests, close code
+``1001`` for websockets) whilst existing connections are awaited for
+up to the ``GRACEFUL_SHUTDOWN_TIMEOUT`` (5 seconds by default), after
+which any remaining connections are forcefully closed. Background
+tasks are then awaited (see
+``BACKGROUND_TASK_SHUTDOWN_TIMEOUT``) before the ``after_serving``
+functions run.
+
+The app exposes a ``/health`` endpoint reporting this state as JSON,
+e.g. ``{"status": "ready", "active_connections": 0}``. It returns
+``200`` whilst ready and ``503`` (with a ``Connection: close``
+header) once the app starts shutting down, which allows a Kubernetes
+readiness probe to stop routing traffic to the pod before it exits.
+
+When serving via Hypercorn (including ``app.run()``) the server's
+``graceful_timeout`` should be at least the
+``GRACEFUL_SHUTDOWN_TIMEOUT`` so the two draining mechanisms do not
+conflict; ``app.run()`` configures this automatically.
+
 Testing
 -------
 

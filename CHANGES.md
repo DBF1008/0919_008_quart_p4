@@ -2,6 +2,13 @@
 
 Unreleased
 
+- Gracefully drain in-flight HTTP and websocket connections on
+  shutdown. New connections are rejected once shutdown begins, active
+  connections are awaited for up to ``GRACEFUL_SHUTDOWN_TIMEOUT``
+  (5 seconds by default) before being forcefully closed, and
+  background tasks are awaited before the app exits. A ``/health``
+  endpoint reports the shutdown state (``ready``/``shutting_down``/
+  ``shutdown``) for orchestrator (e.g. Kubernetes) probes.
 - Flask backport: Fix signing key selection order when key rotation is enabled
   via ``SECRET_KEY_FALLBACKS``.
   <https://github.com/pallets/flask/security/advisories/GHSA-4grg-w6v8-c28g>
