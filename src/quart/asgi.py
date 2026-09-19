@@ -378,6 +378,14 @@ class ASGILifespan:
                         )
                     )
             elif event["type"] == "lifespan.shutdown":
+                # app.shutdown() coordinates the graceful drain: it
+                # stops the app accepting new connections, waits for
+                # in-flight connections to complete (up to
+                # GRACEFUL_SHUTDOWN_TIMEOUT) and awaits background
+                # tasks. The shutdown.complete message is therefore
+                # only sent once the app has fully drained, which
+                # aligns with the server's (e.g. Hypercorn's
+                # graceful_timeout) own connection draining.
                 try:
                     await self.app.shutdown()
                 except Exception as error:

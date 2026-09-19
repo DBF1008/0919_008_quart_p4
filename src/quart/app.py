@@ -32,6 +32,8 @@ from hypercorn.asyncio import serve
 from hypercorn.config import Config as HyperConfig
 from hypercorn.typing import ASGIReceiveCallable
 from hypercorn.typing import ASGISendCallable
+from hypercorn.typing import HTTPResponseBodyEvent
+from hypercorn.typing import HTTPResponseStartEvent
 from hypercorn.typing import Scope
 from werkzeug.datastructures import Authorization
 from werkzeug.datastructures import Headers
@@ -165,6 +167,70 @@ def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
     return timedelta(seconds=value)
 
 
+class ConnectionTracker:
+    """Tracks in-flight HTTP requests and WebSocket connections.
+
+    This is used to gracefully shutdown the app: new connections are
+    rejected once the state leaves ``ready``, in-flight connections
+    are awaited (up to a timeout) and then forcefully closed.
+
+    The state transitions from ``ready`` to ``shutting_down`` to
+    ``shutdown`` and is exposed via the ``/health`` endpoint so that
+    e.g. Kubernetes readiness probes can observe it.
+    """
+
+    def __init__(self) -> None:
+        self.state = "ready"
+        self._connections: set[asyncio.Task] = set()
+        self._drained: asyncio.Event | None = None
+
+    @property
+    def is_accepting(self) -> bool:
+        return self.state == "ready"
+
+    @property
+    def active_count(self) -> int:
+        return len(self._connections)
+
+    def _get_drained(self) -> asyncio.Event:
+        if self._drained is None:
+            self._drained = asyncio.Event()
+            self._drained.set()
+        return self._drained
+
+    def add(self, task: asyncio.Task) -> None:
+        self._connections.add(task)
+        self._get_drained().clear()
+
+    def discard(self, task: asyncio.Task) -> None:
+        self._connections.discard(task)
+        if not self._connections:
+            self._get_drained().set()
+
+    def begin_shutdown(self) -> None:
+        self.state = "shutting_down"
+
+    def complete_shutdown(self) -> None:
+        self.state = "shutdown"
+
+    def reset(self) -> None:
+        self.state = "ready"
+        # Recreate the event as the running loop may have changed.
+        self._drained = None
+
+    async def wait_drained(self) -> None:
+        await self._get_drained().wait()
+
+    async def force_close(self) -> None:
+        tasks = list(self._connections)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._connections.clear()
+        self._get_drained().set()
+
+
 class Quart(App):
     """The web framework class, handles requests and returns responses.
 
@@ -188,6 +254,9 @@ class Quart(App):
             websocket protocol.
         config_class: The class to use for the configuration.
         env: The name of the environment the app is running on.
+        connection_tracker: Tracks in-flight HTTP requests and
+            WebSocket connections so that shutdown can gracefully
+            drain them, see :class:`~quart.app.ConnectionTracker`.
         event_class: The class to use to signal an event in an async
             manner.
         debug: Wrapper around configuration DEBUG value, in many places
@@ -246,6 +315,7 @@ class Quart(App):
             "DEBUG": None,
             "ENV": None,
             "EXPLAIN_TEMPLATE_LOADING": False,
+            "GRACEFUL_SHUTDOWN_TIMEOUT": 10,  # Second
             "MAX_CONTENT_LENGTH": 16 * 1024 * 1024,  # 16 MB Limit
             "MAX_COOKIE_SIZE": 4093,
             "MAX_FORM_MEMORY_SIZE": 500_000,
@@ -256,6 +326,7 @@ class Quart(App):
             "PRESERVE_CONTEXT_ON_EXCEPTION": None,
             "PROPAGATE_EXCEPTIONS": None,
             "PROVIDE_AUTOMATIC_OPTIONS": True,
+            "PROVIDE_HEALTH_ENDPOINT": True,
             "RESPONSE_TIMEOUT": 60,  # Second
             "SECRET_KEY": None,
             "SECRET_KEY_FALLBACKS": None,
@@ -337,6 +408,7 @@ class Quart(App):
         self.before_websocket_funcs: dict[
             AppOrBlueprintKey, list[BeforeWebsocketCallable]
         ] = defaultdict(list)
+        self.connection_tracker = ConnectionTracker()
         self.teardown_websocket_funcs: dict[
             AppOrBlueprintKey, list[TeardownCallable]
         ] = defaultdict(list)
@@ -925,6 +997,11 @@ class Quart(App):
         if debug is not None:
             self.debug = debug
         config.errorlog = config.accesslog
+        # Align Hypercorn's graceful shutdown with Quart's internal
+        # connection draining so that the two do not conflict (both
+        # wait at most GRACEFUL_SHUTDOWN_TIMEOUT for in-flight
+        # connections to complete).
+        config.graceful_timeout = self.config["GRACEFUL_SHUTDOWN_TIMEOUT"]
         config.keyfile = keyfile
 
         return serve(self, config, shutdown_trigger=shutdown_trigger)
@@ -1760,10 +1837,82 @@ class Quart(App):
             asgi_handler = self.asgi_lifespan_class(self, scope)
         else:
             raise RuntimeError("ASGI Scope type is unknown")
-        await asgi_handler(receive, send)
+
+        if scope["type"] == "lifespan" or self._is_health_check(scope):
+            # Lifespan and health check scopes are not tracked, health
+            # checks must also remain available whilst shutting down.
+            await asgi_handler(receive, send)
+            return
+
+        if not self.connection_tracker.is_accepting:
+            await self._reject_connection(scope, send)
+            return
+
+        task = asyncio.current_task()
+        assert task is not None
+        self.connection_tracker.add(task)
+        try:
+            await asgi_handler(receive, send)
+        finally:
+            self.connection_tracker.discard(task)
+
+    def _is_health_check(self, scope: Scope) -> bool:
+        return (
+            scope["type"] == "http"
+            and scope.get("path", "") == "/health"
+            and self.config["PROVIDE_HEALTH_ENDPOINT"]
+        )
+
+    async def _reject_connection(
+        self, scope: Scope, send: ASGISendCallable
+    ) -> None:
+        if scope["type"] == "websocket":
+            # 1012 (Service Restart) indicates the client may retry.
+            await send({"type": "websocket.close", "code": 1012})  # type: ignore[typeddict-item]
+        else:
+            await send(
+                cast(
+                    HTTPResponseStartEvent,
+                    {
+                        "type": "http.response.start",
+                        "status": 503,
+                        "headers": [(b"content-type", b"text/plain; charset=utf-8")],
+                    },
+                )
+            )
+            await send(
+                cast(
+                    HTTPResponseBodyEvent,
+                    {
+                        "type": "http.response.body",
+                        "body": b"Server is shutting down",
+                        "more_body": False,
+                    },
+                )
+            )
+
+    def _register_health_endpoint(self) -> None:
+        if not self.config["PROVIDE_HEALTH_ENDPOINT"]:
+            return
+        for rule in self.url_map.iter_rules():
+            if rule.rule == "/health":
+                # The user (or a previous startup) has already
+                # registered a /health route.
+                return
+        self.add_url_rule("/health", "quart_health", self._health_response)
+
+    async def _health_response(self) -> ResponseReturnValue:
+        state = self.connection_tracker.state
+        status_code = 200 if state == "ready" else 503
+        return {
+            "status": state,
+            "active_connections": self.connection_tracker.active_count,
+        }, status_code
 
     async def startup(self) -> None:
         self.shutdown_event = self.event_class()
+        self.connection_tracker.reset()
+        self._register_health_endpoint()
         try:
             async with self.app_context():
                 for func in self.before_serving_funcs:
@@ -1781,6 +1930,19 @@ class Quart(App):
 
     async def shutdown(self) -> None:
         self.shutdown_event.set()
+        # Stop accepting new connections, then wait for the in-flight
+        # connections to complete within the graceful timeout before
+        # forcefully closing any that remain.
+        self.connection_tracker.begin_shutdown()
+        try:
+            await asyncio.wait_for(
+                self.connection_tracker.wait_drained(),
+                timeout=self.config["GRACEFUL_SHUTDOWN_TIMEOUT"],
+            )
+        except asyncio.TimeoutError:
+            await self.connection_tracker.force_close()
+        self.connection_tracker.complete_shutdown()
+
         try:
             await asyncio.wait_for(
                 asyncio.gather(*self.background_tasks),
